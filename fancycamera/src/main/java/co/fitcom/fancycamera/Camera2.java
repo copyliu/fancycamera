@@ -61,6 +61,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.nio.ReadOnlyBufferException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -109,44 +110,130 @@ class Camera2 extends CameraBase {
     private ImageReader.OnImageAvailableListener readOnImageAvailableListener = new ImageReader.OnImageAvailableListener() {
         @Override
         public void onImageAvailable(ImageReader imageReader) {
-            Image image = imageReader.acquireLatestImage();
-            try {
-                Bitmap bitmap = imageToBitmap(image);
-                save(bitmap);
-            } catch (Throwable t) {
-                // IOException and java.nio.BufferOverflowException are known possibilities,
-                // but likely OutOfMemoryError too
-                // Buffers and Bitmaps are crash prone
-                t.printStackTrace();
-            } finally {
-                reader = null;
-                Uri contentUri = Uri.fromFile(getFile());
-                Intent mediaScanIntent = new android.content.Intent(
-                        "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-                        contentUri
-                );
-                mContext.sendBroadcast(mediaScanIntent);
-                if (getListener() != null) {
-                    PhotoEvent event = new PhotoEvent(EventType.INFO, getFile(), PhotoEvent.EventInfo.PHOTO_TAKEN.toString());
-                    getListener().onPhotoEvent(event);
-                } else {
-                    Log.w(TAG, "No listener found");
+            synchronized (lock){
+                Image image = imageReader.acquireLatestImage();
+                try {
+                    Bitmap bitmap = imageToBitmap(image);
+                    save(bitmap);
+                } catch (Throwable t) {
+                    // IOException and java.nio.BufferOverflowException are known possibilities,
+                    // but likely OutOfMemoryError too
+                    // Buffers and Bitmaps are crash prone
+                    t.printStackTrace();
+                } finally {
+                    reader = null;
+                    Uri contentUri = Uri.fromFile(getFile());
+                    Intent mediaScanIntent = new android.content.Intent(
+                            "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                            contentUri
+                    );
+                    mContext.sendBroadcast(mediaScanIntent);
+                    if (getListener() != null) {
+                        PhotoEvent event = new PhotoEvent(EventType.INFO, getFile(), PhotoEvent.EventInfo.PHOTO_TAKEN.toString());
+                        getListener().onPhotoEvent(event);
+                    } else {
+                        Log.w(TAG, "No listener found");
+                    }
+
+
+
+                        stop();
+                        start(); //TODO allow user to choose
+                        isCapturingPhoto = false;
+
                 }
             }
+
         }
+        private  byte[] YUV_420_888toNV21(Image image) {
 
+            int width = image.getWidth();
+            int height = image.getHeight();
+            int ySize = width*height;
+            int uvSize = width*height/4;
+
+            byte[] nv21 = new byte[ySize + uvSize*2];
+
+            ByteBuffer yBuffer = image.getPlanes()[0].getBuffer(); // Y
+            ByteBuffer uBuffer = image.getPlanes()[1].getBuffer(); // U
+            ByteBuffer vBuffer = image.getPlanes()[2].getBuffer(); // V
+
+            int rowStride = image.getPlanes()[0].getRowStride();
+            assert(image.getPlanes()[0].getPixelStride() == 1);
+
+            int pos = 0;
+
+            if (rowStride == width) { // likely
+                yBuffer.get(nv21, 0, ySize);
+                pos += ySize;
+            }
+            else {
+                long yBufferPos = -rowStride; // not an actual position
+                for (; pos<ySize; pos+=width) {
+                    yBufferPos += rowStride;
+                    yBuffer.position((int) yBufferPos);
+                    yBuffer.get(nv21, pos, width);
+                }
+            }
+
+            rowStride = image.getPlanes()[2].getRowStride();
+            int pixelStride = image.getPlanes()[2].getPixelStride();
+
+            assert(rowStride == image.getPlanes()[1].getRowStride());
+            assert(pixelStride == image.getPlanes()[1].getPixelStride());
+
+            if (pixelStride == 2 && rowStride == width && uBuffer.get(0) == vBuffer.get(1)) {
+                // maybe V an U planes overlap as per NV21, which means vBuffer[1] is alias of uBuffer[0]
+                byte savePixel = vBuffer.get(1);
+                try {
+                    vBuffer.put(1, (byte)~savePixel);
+                    if (uBuffer.get(0) == (byte)~savePixel) {
+                        vBuffer.put(1, savePixel);
+                        vBuffer.position(0);
+                        uBuffer.position(0);
+                        vBuffer.get(nv21, ySize, 1);
+                        uBuffer.get(nv21, ySize + 1, uBuffer.remaining());
+
+                        return nv21; // shortcut
+                    }
+                }
+                catch (ReadOnlyBufferException ex) {
+                    // unfortunately, we cannot check if vBuffer and uBuffer overlap
+                }
+
+                // unfortunately, the check failed. We must save U and V pixel by pixel
+                vBuffer.put(1, savePixel);
+            }
+
+            // other optimizations could check if (pixelStride == 1) or (pixelStride == 2),
+            // but performance gain would be less significant
+
+            for (int row=0; row<height/2; row++) {
+                for (int col=0; col<width/2; col++) {
+                    int vuPos = col*pixelStride + row*rowStride;
+                    nv21[pos++] = vBuffer.get(vuPos);
+                    nv21[pos++] = uBuffer.get(vuPos);
+                }
+            }
+
+            return nv21;
+        }
         private Bitmap imageToBitmap(Image image) {
+
+
             // NV21 is a plane of 8 bit Y values followed by interleaved  Cb Cr
-            ByteBuffer ib = ByteBuffer.allocate(image.getHeight() * image.getWidth() * 2);
-
-            ByteBuffer y = image.getPlanes()[0].getBuffer();
-            ByteBuffer cr = image.getPlanes()[1].getBuffer();
-            ByteBuffer cb = image.getPlanes()[2].getBuffer();
-            ib.put(y);
-            ib.put(cb);
-            ib.put(cr);
-
-            YuvImage yuvImage = new YuvImage(ib.array(),
+//
+//
+//            ByteBuffer y = image.getPlanes()[0].getBuffer();
+//            ByteBuffer cr = image.getPlanes()[1].getBuffer();
+//            ByteBuffer cb = image.getPlanes()[2].getBuffer();
+//
+//            ByteBuffer ib = ByteBuffer.allocate(y.remaining()+cr.remaining()+cb.remaining());
+//            ib.put(y);
+//            ib.put(cb);
+//            ib.put(cr);
+            byte[] nv21=YUV_420_888toNV21(image);
+            YuvImage yuvImage = new YuvImage(nv21,
                     ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -197,6 +284,7 @@ class Camera2 extends CameraBase {
             rotated.recycle();
         }
     };
+    private boolean mAutoFocusSupported;
 
     Camera2(Context context, TextureView textureView, @Nullable FancyCamera.CameraPosition position, @Nullable FancyCamera.CameraOrientation orientation) {
         super(textureView);
@@ -440,6 +528,14 @@ class Camera2 extends CameraBase {
                             mSensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
                             break;
                         }
+                        int[] afAvailableModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+
+                        if (afAvailableModes.length == 0 || (afAvailableModes.length == 1
+                                && afAvailableModes[0] == CameraMetadata.CONTROL_AF_MODE_OFF)) {
+                            mAutoFocusSupported = false;
+                        } else {
+                            mAutoFocusSupported = true;
+                        }
 
                     } else {
                         characteristics = mManager.getCameraCharacteristics(cameraId);
@@ -450,6 +546,14 @@ class Camera2 extends CameraBase {
                                     .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
                             mSensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
                             break;
+                        }
+                        int[] afAvailableModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+
+                        if (afAvailableModes.length == 0 || (afAvailableModes.length == 1
+                                && afAvailableModes[0] == CameraMetadata.CONTROL_AF_MODE_OFF)) {
+                            mAutoFocusSupported = false;
+                        } else {
+                            mAutoFocusSupported = true;
                         }
                     }
                 }
@@ -1006,7 +1110,6 @@ class Camera2 extends CameraBase {
             if (null == mCameraDevice || !getHolder().isAvailable() || null == previewSize || isRecording || isCapturingPhoto) {
                 return;
             }
-
             try {
                 isCapturingPhoto = true;
                 Size[] jpegSizes = null;
@@ -1019,11 +1122,11 @@ class Camera2 extends CameraBase {
 
                 if (jpegSizes != null && jpegSizes.length > 0) {
                     Size size = jpegSizes[0];
-                    width = size.getHeight();
+                    width = size.getWidth();
                     height = size.getHeight();
                 }
 
-                reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2);
+                reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 1);
 
                 SurfaceTexture texture = getHolder().getSurfaceTexture();
                 assert texture != null;
@@ -1032,7 +1135,7 @@ class Camera2 extends CameraBase {
                 List<Surface> surfaces = new ArrayList<>();
                 surfaces.add(reader.getSurface());
                 Surface previewSurface = new Surface(texture);
-                surfaces.add(previewSurface);
+//                surfaces.add(previewSurface);
 
                 final CaptureRequest.Builder photoPreviewBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
                 setupFlash(photoPreviewBuilder);
@@ -1055,14 +1158,15 @@ class Camera2 extends CameraBase {
                 reader.setOnImageAvailableListener(readOnImageAvailableListener, backgroundHandler);
 
                 final CameraCaptureSession.CaptureCallback captureCallback = new CameraCaptureSession.CaptureCallback() {
+
                     @Override
                     public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
                         super.onCaptureCompleted(session, request, result);
-                        synchronized (lock) {
-                            stop();
-                            start(); //TODO allow user to choose
-                            isCapturingPhoto = false;
-                        }
+//
+//                        stop();
+//
+//                        start(); //TODO allow user to choose
+//                        isCapturingPhoto = false;
                     }
 
                     @Override
@@ -1071,7 +1175,6 @@ class Camera2 extends CameraBase {
                         Log.e(TAG, "onCaptureFailed " + session + " " + request);
                     }
                 };
-
                 mCameraDevice.createCaptureSession(surfaces, new CameraCaptureSession.StateCallback() {
                     @Override
                     public void onConfigured(@NonNull CameraCaptureSession session) {
@@ -1161,6 +1264,48 @@ class Camera2 extends CameraBase {
         }
     }
 
+    private void configureTransform2(int viewWidth, int viewHeight) {
+        synchronized (lock) {
+            Activity activity = (Activity) mContext;
+            if (null == getHolder() || null == previewSize || null == activity
+
+            ) {
+                return;
+            }
+
+
+            int mVideoWidth=previewSize.getHeight();
+            int mVideoHeight=previewSize.getWidth();
+            Log.d(TAG, "configureTransform: view"+viewWidth+"x"+viewHeight);
+            Log.d(TAG, "configureTransform: prev"+mVideoWidth+"x"+mVideoHeight);
+            if (viewWidth==0||viewHeight==0||mVideoWidth==0||mVideoHeight==0){
+                return;
+            }
+            float scaleX = 1.0f;
+            float scaleY = 1.0f;
+            if (mVideoWidth > viewWidth && mVideoHeight > viewHeight) {
+                scaleX = mVideoWidth / (float)viewWidth;
+                scaleY = mVideoHeight / (float)viewHeight;
+            } else if (mVideoWidth < viewWidth && mVideoHeight < viewHeight) {
+                scaleY = viewWidth / (float)mVideoWidth;
+                scaleX = viewHeight / (float)mVideoHeight;
+            } else if (viewWidth > mVideoWidth) {
+                scaleY = (viewWidth / (float)mVideoWidth) / (viewHeight / (float)mVideoHeight);
+            } else if (viewHeight > mVideoHeight) {
+                scaleX = (viewHeight / (float)mVideoHeight) / (viewWidth / (float)mVideoWidth);
+            }
+
+            // Calculate pivot points, in our case crop from center
+            int pivotPointX = viewWidth / 2;
+            int pivotPointY = viewHeight / 2;
+
+            Matrix matrix = new Matrix();
+            matrix.setScale(scaleX, scaleY, pivotPointX, pivotPointY);
+
+            getHolder().setTransform(matrix);
+
+        }
+    }
 
     private void configureTransform(int viewWidth, int viewHeight) {
         synchronized (lock) {
@@ -1171,15 +1316,17 @@ class Camera2 extends CameraBase {
             int rotation = activity.getWindowManager().getDefaultDisplay().getRotation();
             Matrix matrix = new Matrix();
             RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
-            RectF bufferRect = new RectF(0, 0, previewSize.getHeight(), previewSize.getWidth());
+            RectF bufferRect =
+                    new RectF(0, 0, previewSize.getHeight(), previewSize.getWidth());
             float centerX = viewRect.centerX();
             float centerY = viewRect.centerY();
 
             bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY());
             matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
-            float scale = Math.max(
-                    (float) viewHeight / previewSize.getHeight(),
-                    (float) viewWidth / previewSize.getWidth());
+
+            float scale = Math.min(
+                    (float) viewHeight / bufferRect.height(),
+                    (float) viewWidth / bufferRect.width());
             matrix.postScale(scale, scale, centerX, centerY);
 
             if (Surface.ROTATION_90 == rotation || Surface.ROTATION_270 == rotation) {
